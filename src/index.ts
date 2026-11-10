@@ -119,8 +119,17 @@ class DiscordLogger {
         }
     }
 
+    private get isNextRuntime(): boolean {
+        const proc = typeof globalThis !== 'undefined' && typeof (globalThis as any).process !== 'undefined'
+            ? (globalThis as any).process
+            : undefined;
+        return !!process.env.NEXT_PUBLIC_ || !!process.env.NEXT_RUNTIME || !!(proc && proc.argv && proc.argv.join(' ').includes('next'));
+    }
+
     private createPinoLogger(): PinoLogger {
         const isDev = process.env.NODE_ENV === 'development';
+        // pino-pretty runs in a worker thread, which Next.js bundling breaks.
+        const runningInNext = this.isNextRuntime;
 
         const baseOptions: PinoLoggerOptions = {
             level: this.config.debug ? 'debug' : 'info',
@@ -128,18 +137,24 @@ class DiscordLogger {
         };
 
         // Use pino-pretty in development for colored output
-        if (isDev && this.config.colors && !this.config.disableConsole) {
-            return pino({
-                ...baseOptions,
-                transport: {
-                    target: 'pino-pretty',
-                    options: {
-                        colorize: true,
-                        translateTime: `SYS:standard`,
-                        ignore: 'pid,hostname',
+        if (isDev && this.config.colors && !this.config.disableConsole && !runningInNext) {
+            try {
+                // pino-pretty is optional: fall back to plain JSON output when it is not installed.
+                require('pino-pretty');
+                return pino({
+                    ...baseOptions,
+                    transport: {
+                        target: 'pino-pretty',
+                        options: {
+                            colorize: true,
+                            translateTime: `SYS:standard`,
+                            ignore: 'pid,hostname',
+                        },
                     },
-                },
-            });
+                });
+            } catch {
+                return pino(baseOptions);
+            }
         }
 
         return pino(baseOptions);

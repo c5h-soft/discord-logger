@@ -12,6 +12,7 @@ Perfect for monitoring your applications in real-time through Discord webhooks.
 - 📊 **Pino integration** - Professional logging with structured data
 - 🔔 **Discord webhooks** - Real-time notifications to your Discord channel
 - 📦 **TypeScript** - Full type support out of the box
+- 📡 **Multiple channels** - Route embeds to one webhook per channel, edit messages, dedupe alerts
 - 🪶 **Lightweight** - Minimal dependencies
 
 ## Installation
@@ -89,6 +90,60 @@ log.info({
 | `disableDiscord` | `boolean`           | `false`       | Disable Discord logging (useful for testing).                            |
 | `disableConsole` | `boolean`           | `false`       | Disable console logging entirely.                                        |
 | `pinoOptions`    | `PinoLoggerOptions` | `{}`          | Custom pino configuration options.                                       |
+| `webhooks`       | `Record<string, string>` | `{}`     | Named webhooks, one per channel. Channels without a URL fall back to `webhookUrl`. |
+| `levelChannels`  | `{ info?, warn?, error?, debug? }` | `{}` | Route plain log levels to a named webhook (e.g. `{ error: 'alerts' }`). |
+| `embedFooter`    | `string`            | `undefined`   | Footer added to embeds sent with `notify()` (e.g. environment name).     |
+
+## Multiple channels (since 1.1.0)
+
+Send rich embeds to a different Discord channel per kind of event. Everything is
+backwards compatible: `webhookUrl` keeps working and acts as the fallback.
+
+```typescript
+import { initDiscordLogger, log, field } from "@c5h-soft/discord-logger";
+
+initDiscordLogger({
+  webhookUrl: process.env.DISCORD_WEBHOOK_URL, // fallback
+  webhooks: {
+    sales: process.env.DISCORD_WEBHOOK_SALES,
+    alerts: process.env.DISCORD_WEBHOOK_ALERTS,
+  },
+  levelChannels: { error: "alerts", warn: "alerts" },
+});
+
+// Embeds never ping unless `mention: true` (sends @here).
+const sent = await log.notify(
+  { channel: "sales", title: "💰 New sale", color: 0x16a34a, fields: [field("Plan", "Pro"), field("Coupon", undefined)] },
+  { wait: true },
+);
+
+// Update the same message later instead of posting a new one.
+if (sent.messageId) await log.edit(sent.messageId, { channel: "sales", title: "💰 New sale · delivered" });
+```
+
+For full control (custom routing, lazy env reads, failure hooks) use the client directly:
+
+```typescript
+import { createDiscordWebhookClient, createAlertDeduper, alertFingerprint } from "@c5h-soft/discord-logger";
+
+const discord = createDiscordWebhookClient({
+  resolveWebhookUrl: (channel) => process.env[`DISCORD_WEBHOOK_${channel.toUpperCase()}`],
+  fallbackWebhookUrl: () => process.env.DISCORD_WEBHOOK_URL,
+  footer: () => (process.env.NODE_ENV === "production" ? undefined : process.env.NODE_ENV),
+  onFailure: (failure) => console.warn("discord delivery failed", failure),
+});
+
+const deduper = createAlertDeduper({ windowMs: 10 * 60_000 });
+const { send, suppressed } = deduper.check(alertFingerprint("error", "timeout for job 123"));
+if (send) await discord.send({ channel: "alerts", title: "Timeout", description: suppressed ? `×${suppressed + 1}` : undefined });
+```
+
+The client:
+
+- enforces Discord embed limits (title 256, field 1024, 25 fields, 6000 total) by truncating instead of failing;
+- disables mentions by default (`allowed_mentions: { parse: [] }`) and neutralizes `@everyone`/`@here`/`<@id>` in user text;
+- serializes requests per webhook and retries once after a `429`, honoring `retry_after`;
+- times out after 5s and never throws: it returns `{ ok, status?, messageId?, errorName? }`.
 
 ## API Reference
 

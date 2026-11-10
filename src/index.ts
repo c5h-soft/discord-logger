@@ -1,4 +1,11 @@
 import pino, { Logger as PinoLogger, LoggerOptions as PinoLoggerOptions } from 'pino';
+import {
+    createDiscordWebhookClient,
+    type DiscordDeliveryResult,
+    type DiscordEmbedMessage,
+    type DiscordSendOptions,
+    type DiscordWebhookClient,
+} from './webhooks';
 
 // ============================================================================
 // Types & Interfaces
@@ -23,7 +30,18 @@ export interface DiscordLoggerConfig {
     disableDiscord?: boolean;
     /** Disable console logging entirely */
     disableConsole?: boolean;
+    /**
+     * Named webhooks, one per Discord channel (e.g. `{ sales: ..., alerts: ... }`).
+     * Channels without a URL fall back to `webhookUrl`.
+     */
+    webhooks?: Record<string, string | undefined>;
+    /** Routes plain log levels to a named webhook, e.g. `{ error: 'alerts', warn: 'alerts' }`. */
+    levelChannels?: Partial<Record<LogLevel, string>>;
+    /** Footer added to embeds sent through `notify()` (e.g. the environment name). */
+    embedFooter?: string;
 }
+
+export type LogLevel = 'info' | 'error' | 'warn' | 'debug';
 
 export interface EventData {
     event: string;
@@ -76,10 +94,14 @@ const LEVEL_ICONS = {
 // ============================================================================
 
 class DiscordLogger {
-    private config: Required<Omit<DiscordLoggerConfig, 'webhookUrl' | 'pinoOptions'>> & {
+    private config: Required<Omit<DiscordLoggerConfig, 'webhookUrl' | 'pinoOptions' | 'webhooks' | 'levelChannels' | 'embedFooter'>> & {
         webhookUrl?: string;
         pinoOptions?: PinoLoggerOptions;
+        webhooks?: Record<string, string | undefined>;
+        levelChannels?: Partial<Record<LogLevel, string>>;
+        embedFooter?: string;
     };
+    private webhookClient: DiscordWebhookClient;
     private pino: PinoLogger;
     private isServer: boolean = typeof globalThis !== 'undefined' && typeof (globalThis as any).window === 'undefined';
     private initialized: boolean = false;
@@ -99,6 +121,7 @@ class DiscordLogger {
 
         // Initialize pino with default settings
         this.pino = this.createPinoLogger();
+        this.webhookClient = this.createWebhookClient();
     }
 
     /**
@@ -112,15 +135,26 @@ class DiscordLogger {
 
         // Recreate pino logger with new settings
         this.pino = this.createPinoLogger();
+        this.webhookClient = this.createWebhookClient();
         this.initialized = true;
 
-        if (!this.config.webhookUrl && !this.config.disableDiscord) {
+        const hasAnyWebhook = Boolean(this.config.webhookUrl) || Object.values(this.config.webhooks ?? {}).some(Boolean);
+        if (!hasAnyWebhook && !this.config.disableDiscord) {
             this.pino.warn('Discord webhook URL not provided - Discord logging disabled');
         }
     }
 
+    private get isNextRuntime(): boolean {
+        const proc = typeof globalThis !== 'undefined' && typeof (globalThis as any).process !== 'undefined'
+            ? (globalThis as any).process
+            : undefined;
+        return !!process.env.NEXT_PUBLIC_ || !!process.env.NEXT_RUNTIME || !!(proc && proc.argv && proc.argv.join(' ').includes('next'));
+    }
+
     private createPinoLogger(): PinoLogger {
         const isDev = process.env.NODE_ENV === 'development';
+        // pino-pretty runs in a worker thread, which Next.js bundling breaks.
+        const runningInNext = this.isNextRuntime;
 
         const baseOptions: PinoLoggerOptions = {
             level: this.config.debug ? 'debug' : 'info',
@@ -128,18 +162,24 @@ class DiscordLogger {
         };
 
         // Use pino-pretty in development for colored output
-        if (isDev && this.config.colors && !this.config.disableConsole) {
-            return pino({
-                ...baseOptions,
-                transport: {
-                    target: 'pino-pretty',
-                    options: {
-                        colorize: true,
-                        translateTime: `SYS:standard`,
-                        ignore: 'pid,hostname',
+        if (isDev && this.config.colors && !this.config.disableConsole && !runningInNext) {
+            try {
+                // pino-pretty is optional: fall back to plain JSON output when it is not installed.
+                require('pino-pretty');
+                return pino({
+                    ...baseOptions,
+                    transport: {
+                        target: 'pino-pretty',
+                        options: {
+                            colorize: true,
+                            translateTime: `SYS:standard`,
+                            ignore: 'pid,hostname',
+                        },
                     },
-                },
-            });
+                });
+            } catch {
+                return pino(baseOptions);
+            }
         }
 
         return pino(baseOptions);
@@ -271,9 +311,25 @@ class DiscordLogger {
     // Discord Integration
     // ========================================================================
 
+    private createWebhookClient(): DiscordWebhookClient {
+        return createDiscordWebhookClient({
+            webhooks: this.config.webhooks,
+            fallbackWebhookUrl: this.config.webhookUrl,
+            footer: this.config.embedFooter,
+            onFailure: (failure) => this.pino.warn({ discord: failure }, 'Failed to send message to Discord'),
+        });
+    }
+
+    /** Webhook for a plain log level: its routed channel if configured, else the default webhook. */
+    private webhookForLevel(level: LogLevel): string | undefined {
+        const channel = this.config.levelChannels?.[level];
+        return (channel && this.webhookClient.resolveWebhookUrl(channel)) || this.config.webhookUrl;
+    }
+
     private async sendToDiscord(content: string, level: keyof typeof LEVEL_ICONS): Promise<void> {
+        const webhookUrl = this.webhookForLevel(level);
         // Skip if not enabled or not in server environment
-        if (!this.isServer || this.config.disableDiscord || !this.config.webhookUrl) {
+        if (!this.isServer || this.config.disableDiscord || !webhookUrl) {
             return;
         }
 
@@ -282,7 +338,7 @@ class DiscordLogger {
             const prefix = this.config.appName ? `[${this.config.appName}] ` : '';
             const fullContent = `${icon} ${prefix}${content}`.substring(0, 2000);
 
-            await fetch(this.config.webhookUrl, {
+            await fetch(webhookUrl, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -466,6 +522,23 @@ class DiscordLogger {
     }
 
     /**
+     * Send a rich embed to a named webhook (see `webhooks`). Never throws; mentions are
+     * disabled unless `mention: true`. Use `wait: true` to get a message id for `edit()`.
+     */
+    async notify(message: DiscordEmbedMessage, options?: DiscordSendOptions): Promise<DiscordDeliveryResult> {
+        if (!this.isServer || this.config.disableDiscord) return { ok: false };
+        return this.webhookClient.send(message, options);
+    }
+
+    /**
+     * Edit an embed previously sent with `notify(message, { wait: true })`.
+     */
+    async edit(messageId: string, message: DiscordEmbedMessage): Promise<DiscordDeliveryResult> {
+        if (!this.isServer || this.config.disableDiscord) return { ok: false };
+        return this.webhookClient.edit(messageId, message);
+    }
+
+    /**
      * Check if the logger has been initialized
      */
     isInitialized(): boolean {
@@ -529,3 +602,4 @@ export function createLogger(config?: DiscordLoggerConfig): DiscordLogger {
 
 // Re-export types
 export type { PinoLogger, PinoLoggerOptions };
+export * from './webhooks';
